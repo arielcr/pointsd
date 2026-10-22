@@ -30,10 +30,23 @@ type Entry struct {
 // ErrUnavailable is returned when the ledger cannot be reached. Retrying may succeed.
 var ErrUnavailable = errors.New("ledger: unavailable")
 
+// ErrNotAwarded is returned by Reverse when the payment has no award entry.
+var ErrNotAwarded = errors.New("ledger: payment has no award")
+
+// Store is shared by every pointsd replica. Award and Reverse are each a single
+// atomic operation (one transaction in Postgres), so the dedupe and cap checks
+// cannot be interleaved by another replica between the read and the write.
 type Store interface {
-	HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error)
-	AwardedInMonth(ctx context.Context, memberID, month string) (int64, error)
-	Append(ctx context.Context, e Entry) error
+	// Award writes the award entry for e.PaymentID, cutting e.Points so the
+	// member's awards in e.Month never exceed monthlyCap. If the payment already
+	// has an award, nothing is written and the stored entry is returned with
+	// created == false.
+	Award(ctx context.Context, e Entry, monthlyCap int64) (stored Entry, created bool, err error)
+	// Reverse writes a reversal that negates exactly the points awarded to
+	// paymentID, in the award's member and month. If the payment was already
+	// reversed, nothing is written and the stored reversal is returned with
+	// created == false. It returns ErrNotAwarded if the payment has no award.
+	Reverse(ctx context.Context, paymentID string) (stored Entry, created bool, err error)
 	Balance(ctx context.Context, memberID string) (int64, error)
 }
 
@@ -80,35 +93,60 @@ func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
 	return nil
 }
 
-func (s *MemoryStore) HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error) {
-	if err := s.roundTrip(ctx, "has_entry"); err != nil {
-		return false, err
+func (s *MemoryStore) Award(ctx context.Context, e Entry, monthlyCap int64) (Entry, bool, error) {
+	if err := s.roundTrip(ctx, "award"); err != nil {
+		return Entry{}, false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if prev, ok := s.find(e.PaymentID, KindAward); ok {
+		return prev, false, nil
+	}
+	// Reversals do not give cap room back, so only awards count.
+	var used int64
+	for _, x := range s.entries {
+		if x.MemberID == e.MemberID && x.Month == e.Month && x.Kind == KindAward {
+			used += x.Points
+		}
+	}
+	e.Kind = KindAward
+	e.Points = min(e.Points, max(monthlyCap-used, 0))
+	s.entries = append(s.entries, e)
+	return e, true, nil
+}
+
+func (s *MemoryStore) Reverse(ctx context.Context, paymentID string) (Entry, bool, error) {
+	if err := s.roundTrip(ctx, "reverse"); err != nil {
+		return Entry{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if prev, ok := s.find(paymentID, KindReversal); ok {
+		return prev, false, nil
+	}
+	award, ok := s.find(paymentID, KindAward)
+	if !ok {
+		return Entry{}, false, ErrNotAwarded
+	}
+	rev := award
+	rev.Kind = KindReversal
+	rev.Points = -award.Points
+	s.entries = append(s.entries, rev)
+	return rev, true, nil
+}
+
+// find returns the entry of the given kind for a payment. s.mu must be held.
+func (s *MemoryStore) find(paymentID string, kind Kind) (Entry, bool) {
 	for _, e := range s.entries {
 		if e.PaymentID == paymentID && e.Kind == kind {
-			return true, nil
+			return e, true
 		}
 	}
-	return false, nil
+	return Entry{}, false
 }
 
-func (s *MemoryStore) AwardedInMonth(ctx context.Context, memberID, month string) (int64, error) {
-	if err := s.roundTrip(ctx, "awarded_in_month"); err != nil {
-		return 0, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var total int64
-	for _, e := range s.entries {
-		if e.MemberID == memberID && e.Month == month && e.Kind == KindAward {
-			total += e.Points
-		}
-	}
-	return total, nil
-}
-
+// Append writes e as is, without the dedupe and cap rules of Award and Reverse.
+// It is meant for seeding a ledger, for example in tests.
 func (s *MemoryStore) Append(ctx context.Context, e Entry) error {
 	if err := s.roundTrip(ctx, "append"); err != nil {
 		return err
